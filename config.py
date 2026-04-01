@@ -63,7 +63,7 @@ SYSTEM_PROMPT = (
     'xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256". '
     "Output only SVG, nothing else."
 )
-GEN_MAX_NEW_TOKENS = 1024      # Balanced: enough for detail, fast enough for best-of-3
+GEN_MAX_NEW_TOKENS = 1536      # Longer SVGs = more visual detail
 GEN_TEMPERATURE = 0.6
 GEN_TOP_P = 0.9
 GEN_REPETITION_PENALTY = 1.05

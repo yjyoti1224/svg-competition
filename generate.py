@@ -165,87 +165,99 @@ def main():
     test_df = pd.read_csv(args.test_csv)
     print(f"Test prompts: {len(test_df)}")
 
-    # --- Best-of-3 BATCHED inference ---
-    # Run 3 full batched passes at different temperatures, then pick best per prompt
-    ATTEMPT_TEMPS = [0.6, 0.4, 0.3]
-
+    # --- Batched inference + individual retry for failures ---
     all_prompts = test_df["prompt"].tolist()
     all_ids = test_df["id"].tolist()
     n_prompts = len(all_prompts)
 
-    # Store all candidates: list of lists, one per prompt
-    all_candidates = [[] for _ in range(n_prompts)]
-
     t0 = time.time()
 
-    for pass_num, temp in enumerate(ATTEMPT_TEMPS):
-        print(f"\n=== Pass {pass_num+1}/{len(ATTEMPT_TEMPS)} (temp={temp}) ===")
-        raw_outputs = []
+    # Step 1: Batched generation (fast)
+    print(f"\n=== Batched generation (temp={GEN_TEMPERATURE}) ===")
+    raw_outputs = []
+    for i in tqdm(range(0, n_prompts, args.batch_size), desc="Batch"):
+        batch_prompts = all_prompts[i:i + args.batch_size]
+        chats = [build_prompt(p) for p in batch_prompts]
+        inputs = tokenizer(
+            chats, return_tensors="pt", padding=True, truncation=True,
+            max_length=MAX_SEQ_LENGTH,
+        ).to(model.device)
 
-        for i in tqdm(range(0, n_prompts, args.batch_size), desc=f"Pass {pass_num+1}"):
-            batch_prompts = all_prompts[i:i + args.batch_size]
-            # Override temperature for this pass
-            chats = [build_prompt(p) for p in batch_prompts]
-            inputs = tokenizer(
-                chats, return_tensors="pt", padding=True, truncation=True,
-                max_length=MAX_SEQ_LENGTH,
-            ).to(model.device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=GEN_MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=GEN_TEMPERATURE,
+                top_p=GEN_TOP_P,
+                repetition_penalty=GEN_REPETITION_PENALTY,
+                pad_token_id=tokenizer.eos_token_id,
+            )
 
-            with torch.no_grad():
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=GEN_MAX_NEW_TOKENS,
-                    do_sample=True,
-                    temperature=temp,
-                    top_p=GEN_TOP_P,
-                    repetition_penalty=GEN_REPETITION_PENALTY,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
+        input_len = inputs["input_ids"].shape[1]
+        for j in range(len(batch_prompts)):
+            gen_ids = output_ids[j][input_len:]
+            decoded = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            raw_outputs.append(decoded)
 
-            input_len = inputs["input_ids"].shape[1]
-            for j in range(len(batch_prompts)):
-                gen_ids = output_ids[j][input_len:]
-                decoded = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                raw_outputs.append(decoded)
+    # Step 2: Post-process and identify failures
+    results = [None] * n_prompts
+    failed_indices = []
 
-        # Post-process this pass and collect candidates
-        for idx, raw in enumerate(raw_outputs):
-            svg = postprocess_svg(raw)
-            is_fallback = (svg == FALLBACK_SVG)
-            valid, _ = check_constraints(svg)
-            has_content = svg_has_content(svg) if valid and not is_fallback else False
+    for idx, raw in enumerate(raw_outputs):
+        svg = postprocess_svg(raw)
+        is_fallback = (svg == FALLBACK_SVG)
+        valid, _ = check_constraints(svg)
+        has_content = svg_has_content(svg) if valid and not is_fallback else False
 
-            if valid and not is_fallback and has_content:
-                all_candidates[idx].append(svg)
-
-        # Stats for this pass
-        n_with_candidates = sum(1 for c in all_candidates if len(c) > 0)
-        elapsed = time.time() - t0
-        print(f"  Pass {pass_num+1} done: {n_with_candidates}/{n_prompts} prompts have candidates, "
-              f"{elapsed/60:.1f}min elapsed")
-
-    # --- Pick best per prompt ---
-    results = []
-    fallback_count = 0
-
-    for idx in range(n_prompts):
-        candidates = all_candidates[idx]
-        if candidates:
-            # Pick the longest SVG (most visual detail)
-            svg = max(candidates, key=len)
+        if valid and not is_fallback and has_content:
+            results[idx] = svg
         else:
-            svg = FALLBACK_SVG
-            fallback_count += 1
+            failed_indices.append(idx)
 
-        results.append({"id": all_ids[idx], "svg": svg})
+    elapsed_batch = time.time() - t0
+    print(f"\nBatch done: {n_prompts - len(failed_indices)}/{n_prompts} succeeded, "
+          f"{len(failed_indices)} need retry, {elapsed_batch/60:.1f}min elapsed")
 
-    print(f"\nBest-of-3 stats: {fallback_count} fallbacks out of {n_prompts}")
+    # Step 3: Retry failures individually at descending temperatures
+    if failed_indices:
+        print(f"\n=== Retrying {len(failed_indices)} failed prompts ===")
+        still_failed = []
+
+        for idx in tqdm(failed_indices, desc="Retry"):
+            prompt_text = all_prompts[idx]
+            success = False
+
+            for temp in RETRY_TEMPS:
+                raw = generate_single(model, tokenizer, prompt_text, temperature=temp)
+                svg = postprocess_svg(raw)
+                is_fallback = (svg == FALLBACK_SVG)
+                valid, _ = check_constraints(svg)
+                has_content = svg_has_content(svg) if valid and not is_fallback else False
+
+                if valid and not is_fallback and has_content:
+                    results[idx] = svg
+                    success = True
+                    break
+
+            if not success:
+                results[idx] = FALLBACK_SVG
+                still_failed.append(idx)
+
+        print(f"  Retry recovered {len(failed_indices) - len(still_failed)}/{len(failed_indices)}")
+        print(f"  Still failed: {len(still_failed)}")
+
+    # Count fallbacks
+    fallback_count = sum(1 for s in results if s == FALLBACK_SVG)
+    final_results = [{"id": all_ids[idx], "svg": results[idx]} for idx in range(n_prompts)]
+
+    print(f"\nFinal stats: {fallback_count} fallbacks out of {n_prompts}")
 
     elapsed = time.time() - t0
 
     # Save submission
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    sub_df = pd.DataFrame(results)
+    sub_df = pd.DataFrame(final_results)
     sub_df.to_csv(args.output, index=False)
 
     print(f"\n{'='*50}")
@@ -257,8 +269,8 @@ def main():
 
     # Sanity check
     print("\nSample outputs:")
-    for i in range(min(3, len(results))):
-        print(f"  [{results[i]['id'][:12]}...] {results[i]['svg'][:120]}...")
+    for i in range(min(3, len(final_results))):
+        print(f"  [{final_results[i]['id'][:12]}...] {final_results[i]['svg'][:120]}...")
 
 
 if __name__ == "__main__":
