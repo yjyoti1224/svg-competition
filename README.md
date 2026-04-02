@@ -31,7 +31,7 @@ environment.yml    — Conda environment specification
 ## Model Weights
 
 Fine-tuned model weights (merged, ~4.3GB):
-**[Google Drive link]** *(see submission for link)*
+**https://huggingface.co/yjyoti001/svg-qwen3.5-2b-qlora**
 
 ## Reproducing Results
 
